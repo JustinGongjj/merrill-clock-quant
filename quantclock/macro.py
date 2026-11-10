@@ -41,6 +41,28 @@ def delayed_monthly_asof(
     return pd.Series(aligned[name].to_numpy(), index=pd.DatetimeIndex(decision_dates), name=name)
 
 
+def _accelerations_on_observation_grid(
+    industrial_production: pd.Series,
+    cpi: pd.Series,
+    growth_accel_lag_months: int,
+    inflation_accel_lag_months: int,
+) -> pd.DataFrame:
+    """Compute growth/inflation acceleration on the monthly observation grid.
+
+    Differencing must happen here, where one row is exactly one observation
+    month, before any as-of replication onto decision dates. Computing the same
+    ``diff(6)`` on decision dates would silently mean "six decision periods"
+    (six days on a daily grid, or a duplicated/zero change whenever two adjacent
+    decisions still see the same released observation).
+    """
+    ip_log = np.log(industrial_production.where(industrial_production > 0))
+    ip_growth6 = ip_log.diff(6) * 100.0
+    growth_accel = ip_growth6 - ip_growth6.shift(growth_accel_lag_months)
+    cpi_yoy = cpi.div(cpi.shift(12)).sub(1.0).mul(100.0)
+    inflation_accel = cpi_yoy - cpi_yoy.shift(inflation_accel_lag_months)
+    return pd.DataFrame({"growth_accel": growth_accel, "inflation_accel": inflation_accel})
+
+
 def make_clock_features(
     industrial_production: pd.Series,
     cpi: pd.Series,
@@ -53,20 +75,27 @@ def make_clock_features(
     """Return as-of-aligned growth/inflation acceleration features.
 
     Growth proxy: change in 6-month industrial-production growth over the
-    configured lag. Inflation proxy: change in 12-month CPI inflation. These are
-    transparent proxies, not official GDP-cycle labels.
+    configured lag. Inflation proxy: change in 12-month CPI inflation. Both are
+    computed on the observation-month grid, then released to the caller's
+    decision calendar with the assumed publication lag, so a daily, weekly or
+    monthly decision grid all receive the same point-in-time value.
+
+    These are transparent proxies, not official GDP-cycle labels, and the
+    release lag is an approximation of the real publication calendar.
     """
     dates = pd.DatetimeIndex(decision_dates).tz_localize(None)
-    ip = delayed_monthly_asof(industrial_production, dates, ip_release_lag_days, "industrial_production")
-    price = delayed_monthly_asof(cpi, dates, cpi_release_lag_days, "cpi")
-    # Compute on the monthly observation grid before as-of alignment would risk
-    # introducing values from a future observation. The aligned values are
-    # differenced only across decision dates, so the same information set is used.
-    ip_growth6 = np.log(ip.where(ip > 0)).diff(6) * 100.0
-    growth_accel = ip_growth6 - ip_growth6.shift(growth_accel_lag_months)
-    cpi_yoy = price.pct_change(12, fill_method=None) * 100.0
-    inflation_accel = cpi_yoy - cpi_yoy.shift(inflation_accel_lag_months)
-    return pd.DataFrame({"growth_accel": growth_accel, "inflation_accel": inflation_accel}, index=dates)
+    ip = _monthly_observations(industrial_production)
+    cpi_monthly = _monthly_observations(cpi)
+    grid = _accelerations_on_observation_grid(
+        ip, cpi_monthly, growth_accel_lag_months, inflation_accel_lag_months
+    )
+    columns = []
+    for column, lag in (("growth_accel", ip_release_lag_days), ("inflation_accel", cpi_release_lag_days)):
+        feature = grid[column].copy()
+        # The month label is all that matters; delayed_monthly_asof re-derives it.
+        feature.index = feature.index.to_timestamp(how="start")
+        columns.append(delayed_monthly_asof(feature, dates, lag, column))
+    return pd.concat(columns, axis=1).reindex(dates)
 
 
 def load_vintage_csv(path: str) -> pd.DataFrame:

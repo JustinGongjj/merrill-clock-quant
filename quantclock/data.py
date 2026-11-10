@@ -13,6 +13,8 @@ import warnings
 
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 FRED_GRAPH = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
 DEFAULT_MACRO_SERIES = {"industrial_production": "INDPRO", "cpi": "CPIAUCSL"}
@@ -23,10 +25,20 @@ DEFAULT_MARKET_TICKERS = {
 }
 
 
+def _session_with_retries(total: int = 3) -> requests.Session:
+    """FRED's CSV endpoint occasionally drops a TLS connection; retry idempotent GETs."""
+    session = requests.Session()
+    retry = Retry(total=total, connect=total, read=total, backoff_factor=0.6,
+                  status_forcelist=(429, 500, 502, 503, 504), allowed_methods=("GET",))
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    session.mount("http://", HTTPAdapter(max_retries=retry))
+    return session
+
+
 def fetch_fred_series(series_id: str, start: str = "1990-01-01", timeout: int = 30) -> pd.Series:
     """Fetch a FRED series as a numeric Series; latest revisions are returned."""
     url = FRED_GRAPH.format(series_id=series_id)
-    response = requests.get(url, params={"cosd": start}, timeout=timeout)
+    response = _session_with_retries().get(url, params={"cosd": start}, timeout=timeout)
     response.raise_for_status()
     frame = pd.read_csv(io.BytesIO(response.content))
     if frame.shape[1] < 2:
@@ -44,6 +56,25 @@ def fetch_fred_panel(series: dict[str, str] | None = None, start: str = "1990-01
     """Fetch named FRED series, aligning by observation date."""
     mapping = series or DEFAULT_MACRO_SERIES
     return pd.concat({name: fetch_fred_series(sid, start=start) for name, sid in mapping.items()}, axis=1)
+
+
+def yahoo_healthy(timeout: int = 6) -> bool:
+    """Cheap reachability probe before a potentially long bulk download.
+
+    Yahoo intermittently throttles the chart endpoint; in that state a
+    yfinance bulk request can hang for minutes. Callers use this probe to
+    switch to the local financial database instead of waiting.
+    """
+    try:
+        response = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/SPY",
+            params={"range": "5d", "interval": "1d"},
+            timeout=timeout,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        return bool(response.ok)
+    except Exception:
+        return False
 
 
 def fetch_market_prices(
@@ -75,6 +106,22 @@ def fetch_market_prices(
     prices.index = pd.to_datetime(prices.index).tz_localize(None)
     prices = prices.apply(pd.to_numeric, errors="coerce").sort_index()
     prices = prices.dropna(how="all")
+
+    # A bulk request can intermittently return an entirely empty column for a
+    # ticker ("possibly delisted; no price data found"). Do not re-request
+    # individual tickers here: when the provider is throttling, a second
+    # download can hang for minutes. Surface the gap instead and let the caller
+    # fall back to the local financial database (--data-source auto/local).
+    empty = [str(c) for c in prices.columns if prices[c].notna().sum() == 0]
+    if empty:
+        warnings.warn(
+            f"Market data provider returned empty columns for: {empty}. "
+            "Use --data-source auto/local to read the local financial database.",
+            RuntimeWarning,
+        )
+    if len(empty) == len(prices.columns):
+        raise RuntimeError("Market data provider returned no usable price columns; "
+                           "use --data-source local")
     warnings.warn("Yahoo Finance data are third-party adjusted-price proxies; verify terms and corporate actions before research use.", RuntimeWarning)
     return prices
 

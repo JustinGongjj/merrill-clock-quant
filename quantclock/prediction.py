@@ -52,11 +52,13 @@ def forecast_metrics(predictions: pd.DataFrame, realized_next_returns: pd.DataFr
     idx = predictions.index.intersection(realized_next_returns.index)
     p = predictions.loc[idx]
     y = realized_next_returns.loc[idx, p.columns]
-    mask = p.notna() & y.notna()
-    pv = p.where(mask).stack()
-    yv = y.where(mask).stack()
+    # Flatten with numpy instead of DataFrame.stack(): pandas 2 drops NaN in
+    # stack() while pandas 3 keeps them, which changes the accuracy denominator.
+    mask = p.notna().to_numpy() & y.notna().to_numpy()
+    pv = pd.Series(p.to_numpy()[mask], dtype=float)
+    yv = pd.Series(y.to_numpy()[mask], dtype=float)
     if len(pv) == 0:
         return {"n_forecasts": 0, "direction_accuracy": float("nan"), "pearson_ic": float("nan")}
     accuracy = float(((pv > 0) == (yv > 0)).mean())
-    ic = float(pv.corr(yv)) if len(pv) > 1 else float("nan")
+    ic = float(pv.corr(yv)) if len(pv) > 1 and pv.std() > 0 and yv.std() > 0 else float("nan")
     return {"n_forecasts": int(len(pv)), "direction_accuracy": accuracy, "pearson_ic": ic}
